@@ -1,44 +1,76 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, sum as _sum 
-from pyspark.sql.types import DoubleType, StringType, StructField, StructType
+from pyspark.sql import SparkSession    
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, TimestampType
+from pyspark.sql.functions import col, from_json, lag, unix_timestamp
+from pyspark.sql.window import Window 
 
-spark = (
-    SparkSession.builder
-    .appName("DataEngineeringFoundations")
-    .master("local[*]")
-    .getOrCreate() 
-)
+myspark = (
+            SparkSession.builder
+           .appName("ClickstreamFunnelAnalysis")
+           .master("local[*]")
+           .config("spark.sql.shuffle.partitions","4")
+           .getOrCreate()
+        )
 
-spark.sparkContext.setLogLevel("WARN")
+myspark.sparkContext.setLogLevel("WARN")
 
-schema = StructType(
+payload_schema = StructType(
     [
-        StructField("transaction_id",StringType(),False),
-        StructField("user_id", StringType(), False),
-        StructField("amount", DoubleType(), True),
-        StructField("status", StringType(), True)
+        StructField("product_id",StringType,True),
+        StructField("price",DoubleType,True),
+        StructField("referrer",StringType,True)
+    ]
+) 
+
+log_schema = StructType(
+    [
+        StructField("event_id",StringType,False),
+        StructField("user_id",StringType,False),
+        StructField("event_type",StringType,False),
+        StructField("timestamp",StringType,False),
+        StructField("attributes",payload_schema,True)
     ]
 )
 
-data = [
-    ("TXN_101", "USER_A", 150.50, "COMPLETED"),
-    ("TXN_102", "USER_B", 200.00, "COMPLETED"),
-    ("TXN_103", "USER_A", 50.25, "CANCELLED"),
-    ("TXN_104", "USER_C", 300.00, "COMPLETED"),
-    ("TXN_105", "USER_B", 120.00, "COMPLETED"),
-    ("TXN_106", "USER_A", 80.00, "COMPLETED")
+raw_json_data = [
+    ('{"event_id": "E101", "user_id": "U1", "event_type": "view", "timestamp": "2026-09-28 10:00:00", "attributes": {"product_id": "P10", "price": 100.0, "referrer": "google"}}'),
+    ('{"event_id": "E102", "user_id": "U1", "event_type": "view", "timestamp": "2026-09-28 10:00:02", "attributes": {"product_id": "P10", "price": 100.0, "referrer": "google"}}',), # Rapid duplicate
+    ('{"event_id": "E103", "user_id": "U1", "event_type": "add_to_cart", "timestamp": "2026-09-28 10:02:00", "attributes": {"product_id": "P10", "price": 100.0, "referrer": "direct"}}',),
+    ('{"event_id": "E104", "user_id": "U1", "event_type": "purchase", "timestamp": "2026-09-28 10:05:00", "attributes": {"product_id": "P10", "price": 100.0, "referrer": "checkout"}}',),
+    ('{"event_id": "E105", "user_id": "U2", "event_type": "view", "timestamp": "2026-09-28 10:10:00", "attributes": {"product_id": "P20", "price": 50.0, "referrer": "facebook"}}',),
+    ('{"event_id": "E106", "user_id": "U2", "event_type": "add_to_cart", "timestamp": "2026-09-28 10:12:00", "attributes": {"product_id": "P20", "price": 50.0, "referrer": "direct"}}',), # Drop-off (No Purchase)
+    ('{"event_id": "E107", "user_id": "U3", "event_type": "view", "timestamp": "2026-09-28 10:15:00", "attributes": {"product_id": "P30", "price": 300.0, "referrer": "google"}}',) # Drop-off (View only)
 ]
 
-df = spark.createDataFrame(data,schema=schema)
+df_raw = myspark.createDataFrame(raw_json_data, ["raw_value"])
 
-filtered_df = df.filter(col("status")=="COMPLETED")
+df_parsed = df_raw.withColumn("data", from_json(col("raw_value"), log_schema)) \
+            .select(col("data.event_id").alias("event_id"),
+                    col("data.user_id").alias("user_id"),
+                    col("data.event_type").alias("event_type"),
+                    col("data.timestamp").cast(TimestampType()).alias("event_time"),
+                    col("data.attributes.product_id").alias("product_id"),
+                    col("data.attributes.price").alias("price")
+            )
 
-grouped_df = filtered_df.groupBy("user_id").agg(_sum("amount").alias("total_spent"))
+print("--- parsed structured log data ---")
+df_parsed.show(truncate=False)
 
-print("--- User Total Spending (Completed Transactions) ---")
-grouped_df.show()
+user_time_window = Window.partitionBy("user_id", "event_type", "product_id").orderBy("event_time")
 
-print("--- Execution Plan (Catalyst Output) ---")
-grouped_df.explain(True)
+df_deduped = df_parsed.withColumn(
+    "prev_event_time", lag("event_time",1).over(user_time_window)
+).withColumn(
+    "time_delta_sec",
+    unix_timestamp(col("event_time")) - unix_timestamp("prev_event_time")
+).filter(
+    col("time_delta_sec").isNull() | (col("time_delta_sec")>5)
+).drop("prev_event_time","time_delta_sec")
 
-spark.stop()
+user_journey_window = Window.partitionBy("user_id").orderBy("event_time")
+
+df_journey = df_deduped(
+    
+)
+
+
+
